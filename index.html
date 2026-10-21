@@ -303,6 +303,12 @@ const SCOREBOARD_URL   = 'https://site.api.espn.com/apis/site/v2/sports/basketba
 const SUMMARY_URL = (id) => `https://site.api.espn.com/apis/site/v2/sports/basketball/wnba/summary?event=${id}`;
 const STANDINGS_URL = `https://site.api.espn.com/apis/v2/sports/basketball/wnba/standings?season=${SEASON}`;
 
+/* Polling: fast while a game is live (or about to tip off), slow otherwise. */
+const LIVE_POLL_MS   = 15_000;      // during a live game
+const IDLE_POLL_MS   = 300_000;     // no game on (5 min)
+const PREGAME_WINDOW = 30 * 60_000; // switch to fast polling 30 min before tip-off
+const STANDINGS_EVERY_MS = 10 * 60_000;
+
 const DREAM_COLOR = '#E31837';
 const OPP_COLOR   = '#8A8A92';
 
@@ -335,6 +341,9 @@ function fireConfetti() {
 /* ── TICKER ── */
 function showTicker(segments) {
     const wrap = document.getElementById('ticker-wrap'), track = document.getElementById('ticker-track');
+    const sig = segments.join('|');
+    if (track.dataset.sig === sig && wrap.classList.contains('visible')) return;
+    track.dataset.sig = sig;
     const oneMsg = segments.map(s => `<span class="ticker-item">${s}</span>`).join('<span class="ticker-sep" aria-hidden="true"> · </span>');
     const copy = `<div class="ticker-copy">${oneMsg}<span class="ticker-sep" aria-hidden="true"> · </span></div>`;
     track.innerHTML = copy + copy;
@@ -344,14 +353,19 @@ function showTicker(segments) {
 }
 
 /* ── ANSWER STATE ── */
-function setAnswer(state, sub) {
+let celebratedId = null;
+function setAnswer(state, sub, gameId) {
     const el = document.getElementById('answer');
     const map = { win:{text:'YES.',cls:'state-win'}, loss:{text:'NO.',cls:'state-loss'}, live:{text:'NOW.',cls:'state-live'}, loading:{text:'—',cls:'state-loading'} };
     const { text, cls } = map[state] || map.loading;
-    el.textContent = text; el.className = `hero-answer ${cls}`;
-    requestAnimationFrame(() => el.classList.add('revealed'));
+    // Only re-animate when the answer actually changes, so frequent polling doesn't flicker.
+    if (el.textContent !== text || !el.classList.contains(cls) || !el.classList.contains('revealed')) {
+        el.textContent = text; el.className = `hero-answer ${cls}`;
+        requestAnimationFrame(() => el.classList.add('revealed'));
+    }
     if (sub) document.getElementById('hero-sub').innerHTML = sub;
-    if (state === 'win') setTimeout(fireConfetti, 200);
+    // Confetti once per win, not on every refresh.
+    if (state === 'win' && gameId !== celebratedId) { celebratedId = gameId; setTimeout(fireConfetti, 200); }
 }
 
 function fmtDate(str) { return new Date(str).toLocaleDateString('en-US', { month:'short', day:'numeric', year:'numeric' }).toUpperCase(); }
@@ -660,7 +674,7 @@ function renderStandings(entries, groupName) {
 /* ── GAME LOG ── */
 function renderGameLog(games) {
     const log = document.getElementById('game-log');
-    log.innerHTML = games.slice().reverse().slice(0,10).map((g,i)=>`
+    const html = games.slice().reverse().slice(0,10).map((g,i)=>`
       <div class="game-row" style="transition-delay:${i*45}ms">
         <div class="row-left">
           <span class="pill ${g.dreamWon ? 'w':'l'}">${g.dreamWon ? 'W':'L'}</span>
@@ -674,6 +688,9 @@ function renderGameLog(games) {
           <div class="row-date">${fmtDate(g.date)}</div>
         </div>
       </div>`).join('');
+    if (log.dataset.sig === html) return;
+    log.dataset.sig = html;
+    log.innerHTML = html;
     requestAnimationFrame(()=>requestAnimationFrame(()=>{ log.querySelectorAll('.game-row').forEach(r=>r.classList.add('in')); }));
 }
 
@@ -770,7 +787,7 @@ function runDemo(mode) {
     ];
     const latest = games[games.length-1];
     renderScoreCard(latest, false);
-    setAnswer(latest.dreamWon ? 'win':'loss', latest.dreamWon ? `<strong>Atlanta</strong> beat the ${latest.opp.short} ${latest.dream.score}–${latest.opp.score}` : `<strong>Atlanta</strong> fell to the ${latest.opp.short} ${latest.dream.score}–${latest.opp.score}`);
+    setAnswer(latest.dreamWon ? 'win':'loss', latest.dreamWon ? `<strong>Atlanta</strong> beat the ${latest.opp.short} ${latest.dream.score}–${latest.opp.score}` : `<strong>Atlanta</strong> fell to the ${latest.opp.short} ${latest.dream.score}–${latest.opp.score}`, latest.id);
     renderLineScore(latest.dream.line, latest.opp.line, latest.opp.short, latest.dream.score, latest.opp.score);
 
     renderTrend(buildDemoPlays(latest.dream.score, latest.opp.score, latest.isHome), latest.isHome, latest.dream.score, latest.opp.score, 'ATL', latest.opp.abbrev);
@@ -830,9 +847,10 @@ async function loadStandings() {
 }
 
 /* ── MAIN ── */
+let fastPoll = false;        // true while a game is live or about to start
+let lastStandingsAt = 0;
+
 async function load() {
-    const demoMode = new URLSearchParams(window.location.search).get('demo');
-    if (demoMode === 'loss' || demoMode === 'win') { runDemo(demoMode); return; }
 
     try {
         const [playoffData, boardData] = await Promise.all([
@@ -854,6 +872,14 @@ async function load() {
             e.competitions?.[0]?.competitors?.some(c=>c.team.id===DREAM_ID) &&
             e.competitions?.[0]?.status?.type?.state==='in');
 
+        // Upcoming Dream game starting soon (or past tip-off but not yet flagged live)?
+        const soonEvt = (boardData.events||[]).find(e => {
+            const c = e.competitions?.[0];
+            if (!c?.competitors?.some(t=>t.team.id===DREAM_ID) || c.status?.type?.state!=='pre') return false;
+            return new Date(e.date).getTime() - Date.now() < PREGAME_WINDOW;
+        });
+        fastPoll = !!(liveEvt || soonEvt);
+
         let latest = null;
         if (liveEvt) {
             document.getElementById('game-label').textContent = 'Live Now';
@@ -866,12 +892,13 @@ async function load() {
             }
             setAnswer('live', `Live at <strong>${latest?.venue || 'the arena'}</strong>`);
         } else if (parsed.length > 0) {
+            document.getElementById('game-label').textContent = 'Last Game';
             latest = parsed[parsed.length-1];
             renderScoreCard(latest, false);
             const sub = latest.dreamWon
                 ? `<strong>Atlanta</strong> beat the ${latest.opp.short} ${latest.dream.score}–${latest.opp.score}`
                 : `<strong>Atlanta</strong> fell to the ${latest.opp.short} ${latest.dream.score}–${latest.opp.score}`;
-            setAnswer(latest.dreamWon ? 'win':'loss', sub);
+            setAnswer(latest.dreamWon ? 'win':'loss', sub, latest.id);
             renderLineScore(latest.dream.line, latest.opp.line, latest.opp.short, latest.dream.score, latest.opp.score);
         } else {
             document.getElementById('score-card').innerHTML = '<div class="error-msg">No recent game data found.</div>';
@@ -889,8 +916,8 @@ async function load() {
             renderGameLog(parsed);
         }
 
-        // Standings (independent fetch)
-        loadStandings();
+        // Standings (independent fetch; they don't change mid-game, so refresh only every 10 min)
+        if (Date.now() - lastStandingsAt > STANDINGS_EVERY_MS) { lastStandingsAt = Date.now(); loadStandings(); }
 
         // Rich data from summary endpoint
         if (latest) {
@@ -923,8 +950,26 @@ async function load() {
     }
 }
 
-load();
-setInterval(load, 60_000);
+/* ── POLLING SCHEDULER ── */
+let pollTimer = null, polling = false;
+function scheduleNext() {
+    clearTimeout(pollTimer);
+    if (document.hidden) return; // paused while the tab is in the background
+    pollTimer = setTimeout(tick, fastPoll ? LIVE_POLL_MS : IDLE_POLL_MS);
+}
+async function tick() {
+    if (polling) return;
+    polling = true;
+    try { await load(); } finally { polling = false; scheduleNext(); }
+}
+// Pause in background tabs; refresh immediately when the fan comes back.
+document.addEventListener('visibilitychange', () => {
+    if (document.hidden) clearTimeout(pollTimer); else tick();
+});
+
+const demoMode = new URLSearchParams(window.location.search).get('demo');
+if (demoMode === 'loss' || demoMode === 'win') runDemo(demoMode);
+else tick();
 window.addEventListener('resize', () => { const c=document.getElementById('confetti'); c.width=window.innerWidth; c.height=window.innerHeight; if (trendState) positionTrend(trendState.curIdx); });
 </script>
 </body>
